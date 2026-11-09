@@ -57,6 +57,10 @@ const binding = createChannelBinding(session(agentA), owner)
 const state = {
   agentBindingGeneration: 0, provider: 'p', model: 'm', status: 'idle', pending: [], working: false,
   cancelPending: false, activeToolCount: 0, emit() {}, emitStream() {},
+  // The projected session state a bind sees: the project root plus the
+  // current directory a `/cd` moved to. Edit attribution must follow the
+  // latter (a relative tool path resolves against it), never the former.
+  cwd: '/project', workingDirectory: '/project/sub',
 }
 const modelSelection = createModelSelection(ctx as never, { owner, agent: () => binding.agent! })
 const { selection } = modelSelection
@@ -66,6 +70,7 @@ const childState = { rows: [], subagents: [], emit() { childStarts += 1 }, emitS
 const subagents = createSubagentProjection(() => childState, {
   rowIds: { value: 0 }, agent: () => binding.agent, subagents: () => undefined, lookupChild: () => undefined,
 })
+const editBindings: Array<{ sessionId: string; cwd: string }> = []
 const events = createBindingEvents(ctx as never, {
   owner, binding, state: state as never,
   activity: { start() {}, stop() {}, onAgentStatus() {}, onSessionEvent() {} },
@@ -74,9 +79,17 @@ const events = createBindingEvents(ctx as never, {
   modeActions: { refreshMode() {}, onSessionEvent() {}, async applyRememberedPermission() {} },
   projector: { apply() { projected += 1 }, settleStreaming() {}, updateSpinnerMode() {} } as never,
   subagents,
+  editSignal: {
+    bind(next) { editBindings.push(next) },
+    onSessionEvent() {},
+  },
   agentView: { schedule() {} },
 })
 events.bind()
+assert.equal(editBindings.length, 1, 'a bind attributes the edit forwarder once')
+assert.equal(editBindings[0]!.cwd, '/project/sub',
+  'edit attribution follows the projected working directory, not the project root')
+assert.equal(editBindings[0]!.sessionId, String(agentA.session.id), 'edit attribution is the bound session id')
 const oldStatus = listeners.get('agent/status')![0]!
 const oldSession = listeners.get('session/event')!.at(-1)!
 const oldChild = listeners.get('subagent/start')![0]!

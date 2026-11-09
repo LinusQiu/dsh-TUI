@@ -3,13 +3,16 @@
  * 与 `ide-channel.ts` 的可选能力握手）。
  *
  * 覆盖：
- *   1. 结果载荷归一化：edit 多 hunk、write 新建（无 hunk）、apply_patch
- *      多文件 + stopped、相对路径按会话 cwd 解析；
+ *   1. 结果载荷归一化：edit 多 hunk、纯插入 hunk（上游 `oldText: null`）、
+ *      write 新建 / 覆盖空文件、apply_patch 多文件 + stopped、相对路径按
+ *      会话当前工作目录解析；
  *   2. 丢弃面：错误结果、未登记工具、孤儿结果、重复 callId、畸形 meta、
- *      超长 hunk、超量文件、未知 capabilities；
- *   3. 生命周期：bind 重置（新会话不继承旧 callId 台账）、dispose 静默；
+ *      超长 hunk、超量文件、未知 capabilities、缺失 oldText；
+ *   3. 生命周期：bind 重置（新会话不继承旧 callId 台账）、同会话 cwd 变化
+ *      （rebind 与 live `working-directory/change`）、dispose 静默；
  *   4. 通道：hello_ack 声明的能力才发送；旧服务端（无 capabilities）连接
- *      成功但不发送；stop 清能力；未连接发送返回 false 不抛错。
+ *      成功但不发送；stop 清能力；未连接发送返回 false 不抛错；超过整帧
+ *      上限的通知被拒。
  *
  * 运行：node --import tsx/esm scripts/verify-edit-signal.ts
  * （已登记进 scripts/run-ci-group.mjs 的 channel-ui 组）
@@ -126,6 +129,54 @@ function forwarderChecks(cwd: string): void {
   }))
   check('路径：相对路径按会话 cwd 解析为绝对路径',
     sent[before() - 1]?.files[0].path === resolve(cwd, 'src/rel.ts'))
+
+  // ── 2b. 纯插入 hunk：上游 `oldText: null` 不是畸形，归一化为空串 ──────────
+  forwarder.onSessionEvent(toolCall('call-null-old', 'edit'))
+  forwarder.onSessionEvent(toolResult('call-null-old', {
+    path: a,
+    diffs: [{ path: a, oldText: null, newText: 'inserted-line' }],
+  }))
+  const nullOld = sent[before() - 1]
+  check('edit：纯插入 hunk（oldText=null）→ 归一化为空串并发送',
+    nullOld?.files.length === 1
+    && nullOld.files[0].diffs.length === 1
+    && nullOld.files[0].diffs[0].oldText === ''
+    && nullOld.files[0].diffs[0].newText === 'inserted-line')
+
+  const emptyWrite = join(cwd, 'empty.ts')
+  forwarder.onSessionEvent(toolCall('call-null-write', 'write'))
+  forwarder.onSessionEvent(toolResult('call-null-write', {
+    operation: 'update',
+    path: emptyWrite,
+    diffs: [{ path: emptyWrite, oldText: null, newText: 'first-line' }],
+  }))
+  const emptyWriteNotification = sent[before() - 1]
+  check('write 覆盖空文件：oldText=null 的 hunk 不再整条丢弃',
+    emptyWriteNotification?.files.length === 1
+    && emptyWriteNotification.files[0].operation === 'update'
+    && emptyWriteNotification.files[0].diffs[0].oldText === '')
+
+  const mixedNullA = join(cwd, 'mixed-null-a.ts')
+  const mixedNullB = join(cwd, 'mixed-null-b.ts')
+  forwarder.onSessionEvent(toolCall('call-null-patch', 'apply_patch'))
+  forwarder.onSessionEvent(toolResult('call-null-patch', {
+    diffs: [
+      { path: mixedNullA, oldText: null, newText: 'added' },
+      { path: mixedNullB, oldText: 'old', newText: 'new' },
+    ],
+  }))
+  const mixedNull = sent[before() - 1]
+  check('apply_patch：含纯插入 hunk（null）时其余文件不连坐',
+    mixedNull?.files.length === 2
+    && mixedNull.files.every(file => file.diffs.every(diff => typeof diff.oldText === 'string')))
+
+  const beforeUndefinedOld = before()
+  forwarder.onSessionEvent(toolCall('call-missing-old', 'edit'))
+  forwarder.onSessionEvent(toolResult('call-missing-old', {
+    path: a,
+    diffs: [{ path: a, newText: 'no-old-field' }],
+  }))
+  check('丢弃：oldText 缺失（非 null）仍视为畸形', before() === beforeUndefinedOld)
 
   // ── 3. write 新建：无 hunk 仍是可审阅事务 ───────────────────────────────
   const created = join(cwd, 'created.ts')
@@ -356,6 +407,49 @@ function forwarderChecks(cwd: string): void {
   cwdChanged.bind({ sessionId: 'session-cwd', cwd: join(cwd, 'sub') })
   cwdChanged.onSessionEvent(toolResult('cwd-call', { path: a, diffs: [{ path: a, oldText: 'c1', newText: 'c2' }] }))
   check('reattach：同会话 cwd 变化丢弃在途调用（防错路径）', cwdChangedSent.length === 0)
+
+  // ── 9b. 会话内工作目录变化事件：转发器自己跟随（不依赖重新 bind）────────
+  const movedSent: EditTransactionNotification[] = []
+  const moved = createEditSignalForwarder(notification => {
+    movedSent.push(notification)
+    return true
+  })
+  const movedSub = join(cwd, 'sub')
+  moved.bind({ sessionId: 'session-moved', cwd })
+  moved.onSessionEvent({ type: 'working-directory/change', data: { cwd: movedSub } })
+  moved.onSessionEvent(toolCall('moved-relative', 'edit'))
+  moved.onSessionEvent(toolResult('moved-relative', {
+    path: 'nested/rel.ts',
+    diffs: [{ path: 'nested/rel.ts', oldText: 'm1', newText: 'm2' }],
+  }))
+  check('目录：working-directory/change 后相对路径按新目录解析',
+    movedSent[0]?.files[0].path === resolve(movedSub, 'nested/rel.ts'))
+
+  const movedSecondSub = join(cwd, 'sub2')
+  moved.onSessionEvent(toolCall('moved-inflight', 'edit'))
+  moved.onSessionEvent({ type: 'working-directory/change', data: { cwd: movedSecondSub } })
+  moved.onSessionEvent(toolResult('moved-inflight', {
+    path: a,
+    diffs: [{ path: a, oldText: 'i1', newText: 'i2' }],
+  }))
+  check('目录：变化前的在途调用被丢弃（防错路径）', movedSent.length === 1)
+
+  moved.onSessionEvent(toolCall('moved-same-cwd', 'edit'))
+  moved.onSessionEvent({ type: 'working-directory/change', data: { cwd: movedSecondSub } })
+  moved.onSessionEvent(toolResult('moved-same-cwd', {
+    path: a,
+    diffs: [{ path: a, oldText: 's1', newText: 's2' }],
+  }))
+  check('目录：目录未变的事件不清空在途调用', movedSent.length === 2)
+
+  moved.onSessionEvent({ type: 'working-directory/change', data: {} })
+  moved.onSessionEvent(toolCall('moved-malformed', 'edit'))
+  moved.onSessionEvent(toolResult('moved-malformed', {
+    path: 'still-relative.ts',
+    diffs: [{ path: 'still-relative.ts', oldText: 'q1', newText: 'q2' }],
+  }))
+  check('目录：畸形目录事件被忽略（仍按最后有效目录解析）',
+    movedSent[2]?.files[0].path === resolve(movedSecondSub, 'still-relative.ts'))
 
   // ── 10. 发送失败不永久封死 callId（后续重复结果可重试）──────────────────
   let accept = false

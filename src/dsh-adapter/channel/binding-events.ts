@@ -196,9 +196,13 @@ export function createBindingEvents(ctx: Context, deps: {
       // raw tap is append-time only (the resume/rewind path reads history
       // without emitting), and the bind resets the forwarder's per-session
       // state so a parked session cannot leak an old call into this one.
+      // Attribution starts from the session's CURRENT working directory (the
+      // projector folds `working-directory/change` into `state.workingDirectory`
+      // before bind, so a resumed session that moved is hydrated too); later
+      // moves are handled by the forwarder itself.
       const editSignal = deps.editSignal
       if (editSignal !== undefined) {
-        editSignal.bind({ sessionId: String(capture.session.ref.sessionId), cwd: capture.session.cwd })
+        editSignal.bind({ sessionId: String(capture.session.ref.sessionId), cwd: sessionWorkingDirectory(deps.state) })
         register(native.subscribeRaw(event => {
           if (!current()) return
           editSignal.onSessionEvent(event)

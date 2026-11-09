@@ -12,7 +12,11 @@
  * which is exactly why this module may only forward LIVE events. The raw
  * subscriber (`native.subscribeRaw`) taps live appends, and the binding
  * resets this forwarder on every rebind, so a parked session cannot leak an
- * old call into the next one.
+ * old call into the next one. Relative result paths resolve against the
+ * session's CURRENT working directory: the binding hands in the projected
+ * value at bind time, and a live `working-directory/change` moves the
+ * forwarder itself (the move also drops the calls opened under the old
+ * directory, whose relative paths would now resolve wrong).
  *
  * Everything here is best-effort: a malformed meta, an oversized
  * transaction, an unknown tool, or a disconnected channel all degrade to
@@ -54,7 +58,9 @@ const MAX_NOTIFICATION_CHARS = 256 * 1024
 export type EditSignalSession = {
   /** DSH session id, sent to the receiver for attribution. */
   sessionId: string
-  /** Session cwd, used to resolve a tool's relative result path. */
+  /** The session's CURRENT working directory — where the tool resolves a
+   *  relative result path now, not the project it opened in. A live
+   *  `working-directory/change` updates this inside the forwarder. */
   cwd: string
 }
 
@@ -120,6 +126,19 @@ export function createEditSignalForwarder(send: EditSignalSink): EditSignalForwa
     // than the append marker — object or unknown string — is refused.
     const surfaceOp = event.surfaceOp
     if (surfaceOp !== undefined && surfaceOp !== 'append') return
+    // A move inside the session re-targets relative-path resolution: the next
+    // tool call resolves against the NEW directory. Calls opened before the
+    // move carry paths resolved against the old one, so they are dropped (a
+    // missed review entry beats a wrong ledger path). An unchanged directory
+    // is not a move and leaves the in-flight calls alone.
+    if (event.type === 'working-directory/change') {
+      const data = asRecord(event.data)
+      const nextCwd = data === undefined ? undefined : asNonEmptyString(data.cwd)
+      if (nextCwd === undefined || nextCwd === session.cwd) return
+      openCalls.clear()
+      session = { ...session, cwd: nextCwd }
+      return
+    }
     if (event.type === 'tool/call') {
       const data = asRecord(event.data)
       if (data === undefined) return
@@ -205,12 +224,17 @@ function absolutePath(path: string, cwd: string): string | undefined {
   return resolve(cwd, path)
 }
 
-/** Validate one `{path, oldText, newText}` hunk from a tool result's meta. */
+/** Validate one `{path, oldText, newText}` hunk from a tool result's meta.
+ *  `dsh-tool-fs` reports a pure insertion (a hunk with no replaced line) as
+ *  `oldText: null` — its own meta validator accepts that shape. The wire
+ *  protocol carries the empty string instead, so receivers only ever handle
+ *  one text type; `null` is not malformed, but a missing `oldText` still is. */
 function parseHunk(value: unknown): { path: string; oldText: string; newText: string } | undefined {
   const record = asRecord(value)
   if (record === undefined) return undefined
   const path = asNonEmptyString(record.path)
-  const oldText = record.oldText
+  const rawOldText = record.oldText
+  const oldText = rawOldText === null ? '' : rawOldText
   const newText = record.newText
   if (path === undefined || typeof oldText !== 'string' || typeof newText !== 'string') return undefined
   if (oldText.length > MAX_TEXT_CHARS || newText.length > MAX_TEXT_CHARS) return undefined
