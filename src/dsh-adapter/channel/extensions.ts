@@ -614,7 +614,12 @@ export function attachDshExtensions(
   // Event subscription routing is a distinct binding owner. Its hooks run in
   // every core bind: owner-level child listeners once, then the activity seed,
   // activation of that agent's model selection, and foreground raw subscribers.
-  const editSignal = createEditSignalForwarder(notification => core.sendEditTransaction(notification))
+  const editSignal = createEditSignalForwarder(
+    notification => core.sendEditTransaction(notification),
+    // Cheap capability probe: the forwarder asks before building a payload the
+    // connected server could not receive (and re-checks on send).
+    () => core.supportsEditTransaction(),
+  )
   // No timers or sockets of its own, but it holds per-session ledgers; release
   // them with the rest of the channel so a disposed composition keeps nothing.
   owner.own(() => editSignal.dispose())

@@ -1130,6 +1130,10 @@ export function createCoreChannel(
      *  only while connected to a server that declared the capability. */
     sendEditTransaction: (notification: EditTransactionNotification): boolean =>
       ideChannel.sendEditTransaction(notification),
+    /** Cheap pre-flight for the same sender: lets the forwarder skip building
+     *  a notification no server can receive (no link, or no capability). The
+     *  sender re-checks, so this is only an early exit, never the authority. */
+    supportsEditTransaction: (): boolean => ideChannel.supportsEditTransaction,
     refreshGitBranch,
     /** Merge an extension's contributions (before `start`, or in the adoption window). */
     extend(next: ChannelExtension): void {

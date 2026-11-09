@@ -193,26 +193,24 @@ export function createBindingEvents(ctx: Context, deps: {
       const native = capture.session.capabilities.native.dsh
       if (native === undefined) return
       // Live durable file-tool edits feed the IDE channel's edit review. The
-      // raw tap is append-time only (the resume/rewind path reads history
+      // raw tap below is append-time only (the resume/rewind path reads history
       // without emitting), and the bind resets the forwarder's per-session
       // state so a parked session cannot leak an old call into this one.
       // Attribution starts from the session's CURRENT working directory (the
       // projector folds `working-directory/change` into `state.workingDirectory`
       // before bind, so a resumed session that moved is hydrated too); later
       // moves are handled by the forwarder itself.
-      const editSignal = deps.editSignal
-      if (editSignal !== undefined) {
-        editSignal.bind({ sessionId: String(capture.session.ref.sessionId), cwd: sessionWorkingDirectory(deps.state) })
-        register(native.subscribeRaw(event => {
-          if (!current()) return
-          editSignal.onSessionEvent(event)
-        }))
-      }
+      deps.editSignal?.bind({
+        sessionId: String(capture.session.ref.sessionId),
+        cwd: sessionWorkingDirectory(deps.state),
+      })
       // Raw durable events for the DSH specialists. Registered before the
       // session subscription, so each event reaches them before the
-      // projector folds it.
+      // projector folds it. The edit forwarder rides this same tap: it only
+      // reads the event, so a bind that skips it needs no second subscription.
       register(native.subscribeRaw(event => {
         if (!current()) return
+        deps.editSignal?.onSessionEvent(event)
         deps.messageObserver?.publish(native.agent.session, event)
         deps.modeActions.onSessionEvent(native.agent.session, event)
         deps.jobs?.onSessionEvent(event)

@@ -68,6 +68,13 @@ export const IDE_PROTOCOL_VERSION = 2
 const SELECTION_METHOD = 'selection_changed'
 /** Edit notification this client sends to a capability-declaring server. */
 export const EDIT_TRANSACTION_METHOD = 'edit_transaction'
+/**
+ * Longest serialized `edit_transaction` frame the sender puts on the wire, in
+ * characters. The forwarder already bounds the text it builds; this is the one
+ * place that measures the FINAL frame (envelope included), so the payload is
+ * stringified exactly once on the send path.
+ */
+export const MAX_EDIT_TRANSACTION_CHARS = 256 * 1024
 /** Total connection budget across all candidates, in milliseconds. */
 const CONNECT_BUDGET_MS = 300
 
@@ -242,6 +249,19 @@ function platformCaseInsensitive(): boolean {
 }
 
 /**
+ * True when a NORMALIZED path is the root itself or lives under it. The POSIX
+ * root `/` matches every absolute path without a `//` boundary. Shared by
+ * discovery (`pickLockCandidates`: does this window's workspace contain the
+ * session cwd?) and notification scoping (`filesInsideAckedWorkspace`: does
+ * this window's workspace contain the edited file?): both answer the same
+ * containment question, so a boundary fix (UNC, drive roots) cannot land in
+ * one copy and miss the other.
+ */
+function isInsideIdeRoot(path: string, root: string): boolean {
+  return root === '/' ? path.startsWith('/') : path === root || path.startsWith(`${root}/`)
+}
+
+/**
  * Read and parse one lock file. Returns undefined for unreadable or
  * malformed content (broken JSON, wrong field types) — a single bad lock
  * must never break the whole scan.
@@ -333,9 +353,7 @@ export function pickLockCandidates(lockDir: string, cwd: string, pid?: number): 
     for (const folder of entry.workspaceFolders) {
       const root = normalizeIdePath(folder, caseInsensitive)
       if (root === '') continue
-      const hits = root === '/'
-        ? cwdNorm.startsWith('/')
-        : cwdNorm === root || cwdNorm.startsWith(`${root}/`)
+      const hits = isInsideIdeRoot(cwdNorm, root)
       if (hits && root.length > matchLength) matchLength = root.length
     }
     // No workspace folder covers the session cwd → not a candidate. Keeping
@@ -481,9 +499,7 @@ export class IdeChannel {
     if (roots.length === 0) return []
     return files.filter(file => {
       const path = normalizeIdePath(file.path, caseInsensitive)
-      return roots.some(root => root === '/'
-        ? path.startsWith('/')
-        : path === root || path.startsWith(`${root}/`))
+      return roots.some(root => isInsideIdeRoot(path, root))
     })
   }
 
@@ -493,7 +509,8 @@ export class IdeChannel {
    * the IDE link is a live side channel, so a dropped frame degrades exactly
    * like a dropped selection push (AC-4). A false return is the whole
    * failure surface — absent server, no capability, no file inside the
-   * connected workspace, serialization error, or a socket that died mid-send.
+   * connected workspace, a frame above {@link MAX_EDIT_TRANSACTION_CHARS},
+   * serialization error, or a socket that died mid-send.
    */
   sendEditTransaction(notification: EditTransactionNotification): boolean {
     if (!this.supportsEditTransaction || this.socket === null) return false
@@ -506,6 +523,7 @@ export class IdeChannel {
     } catch {
       return false
     }
+    if (frame.length > MAX_EDIT_TRANSACTION_CHARS) return false
     try {
       this.socket.send(frame)
       return true

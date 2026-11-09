@@ -466,6 +466,33 @@ function forwarderChecks(cwd: string): void {
   retry.onSessionEvent(toolResult('retry-call', { path: a, diffs: [{ path: a, oldText: 't1', newText: 't2' }] }))
   check('发送失败不永久封死 callId（重复结果可重试）', retrySent.length === 2)
 
+  // ── 10b. 能力门控：canSend 为假时连通知都不构建（构建前询问一次）──────
+  const gatedSent: EditTransactionNotification[] = []
+  let canSendCalls = 0
+  let gateOpen = false
+  const gated = createEditSignalForwarder(notification => {
+    gatedSent.push(notification)
+    return true
+  }, () => {
+    canSendCalls += 1
+    return gateOpen
+  })
+  gated.bind({ sessionId: 'session-gate', cwd })
+  gated.onSessionEvent(toolCall('gate-closed', 'edit'))
+  gated.onSessionEvent(toolResult('gate-closed', {
+    path: a,
+    diffs: [{ path: a, oldText: 'g1', newText: 'g2' }],
+  }))
+  check('能力门控：canSend 为假 → 不构建、不发送（只问一次）',
+    gatedSent.length === 0 && canSendCalls === 1)
+  gateOpen = true
+  gated.onSessionEvent(toolCall('gate-open', 'edit'))
+  gated.onSessionEvent(toolResult('gate-open', {
+    path: a,
+    diffs: [{ path: a, oldText: 'g3', newText: 'g4' }],
+  }))
+  check('能力门控：canSend 为真 → 正常发送', gatedSent.length === 1 && canSendCalls === 2)
+
   // ── 11. 跟踪表上限：最早的在途调用被淘汰，最新调用仍可发送 ───────────────
   const evictSent: EditTransactionNotification[] = []
   const evict = createEditSignalForwarder(notification => {
@@ -513,6 +540,17 @@ async function channelChecks(tmpRoot: string): Promise<void> {
   check('通道：帧内 hunk 原文一致',
     params?.files[0]?.diffs[0]?.oldText === 'before' && params.files[0].diffs[0].newText === 'after')
 
+  // 整帧上限在通道一侧量一次最终帧（转发器只按文本累计做便宜闸门）。
+  const oversized = channel.sendEditTransaction({
+    sessionId: 'session-wire',
+    callId: 'wire-oversize',
+    tool: 'edit',
+    files: [{ path: '/repo/huge.ts', diffs: [{ oldText: '', newText: 'x'.repeat(300 * 1024) }] }],
+  })
+  await sleep(120) // 固定窗:pacing 确认「无帧到达」的观测窗，无本地锚点可 settle
+  check('通道：超过整帧上限的通知不发送',
+    oversized === false && capabilityAck.received.length === 1)
+
   channel.stop()
   check('通道：stop 后能力清零', channel.supportsEditTransaction === false)
   capabilityAck.close()
@@ -549,8 +587,38 @@ async function channelChecks(tmpRoot: string): Promise<void> {
   })
   check('作用域：全部在工作区外 → 不发送',
     outsideSent === false && scopedAck.received.length === 1)
+  const siblingSent = scopedChannel.sendEditTransaction({
+    sessionId: 'session-scoped',
+    callId: 'scoped-sibling',
+    tool: 'edit',
+    files: [{ path: '/repo2/b.ts', diffs: [{ oldText: 'g', newText: 'h' }] }],
+  })
+  check('作用域：前缀相同但不在根内（/repo2 vs /repo）→ 不发送',
+    siblingSent === false && scopedAck.received.length === 1)
   scopedChannel.stop()
   scopedAck.close()
+
+  // 根工作区：POSIX '/' 覆盖所有绝对路径（与 discovery 共用同一套包含判断）。
+  const rootAck = await startWsFixture(token, ['/'], {
+    clearSelectionAfterMs: null,
+    capabilities: { editTransaction: true },
+  })
+  const rootChannel = new IdeChannel()
+  await rootChannel.start(
+    { DSH_TUI_IDE_PORT: String(rootAck.port), DSH_TUI_IDE_TOKEN: token },
+    join(tmpRoot, 'locks-root'),
+    '/repo',
+  )
+  const rootSent = rootChannel.sendEditTransaction({
+    sessionId: 'session-root',
+    callId: 'root-inside',
+    tool: 'edit',
+    files: [{ path: '/anywhere/deep/a.ts', diffs: [{ oldText: 'a', newText: 'b' }] }],
+  })
+  await waitFor(() => rootAck.received.length > 0, 3000)
+  check('作用域：根工作区 / 覆盖任意绝对路径', rootSent && rootAck.received.length === 1)
+  rootChannel.stop()
+  rootAck.close()
 
   // 空工作区根：窗口没有声明任何可映射的 workspace → 一条也不发。
   const noRootsAck = await startWsFixture(token, [], {

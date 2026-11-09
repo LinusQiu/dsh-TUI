@@ -26,16 +26,17 @@
  * Bounds (long sessions must stay flat): {@link MAX_TRACKED_CALLS} live
  * calls, {@link MAX_SENT_CALL_IDS} forwarded ids, {@link MAX_FILES} files per
  * notification, {@link MAX_HUNKS} hunks per notification,
- * {@link MAX_TEXT_CHARS} per hunk side, {@link MAX_NOTIFICATION_CHARS} per
- * serialized notification. Anything above a bound is dropped whole rather
- * than truncated — a partial hunk would be a wrong review entry.
+ * {@link MAX_TEXT_CHARS} per hunk side, and the channel's own
+ * {@link MAX_EDIT_TRANSACTION_CHARS} on the serialized frame (measured once,
+ * at send time). Anything above a bound is dropped whole rather than
+ * truncated — a partial hunk would be a wrong review entry.
  */
 import { isAbsolute, resolve } from 'node:path'
-import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { toolResultPayload } from './compat/messages.js'
-import type {
-  EditTransactionDiff,
-  EditTransactionNotification,
+import {
+  MAX_EDIT_TRANSACTION_CHARS,
+  type EditTransactionDiff,
+  type EditTransactionNotification,
 } from './ide-channel.js'
 
 /** Tools whose result meta carries replayable file hunks. */
@@ -51,8 +52,6 @@ const MAX_FILES = 64
 const MAX_HUNKS = 512
 /** Longest single hunk text (either side) accepted, in characters. */
 const MAX_TEXT_CHARS = 64 * 1024
-/** Longest serialized notification accepted, in characters. */
-const MAX_NOTIFICATION_CHARS = 256 * 1024
 
 /** Where the forwarder attributes the events it sees. */
 export type EditSignalSession = {
@@ -90,13 +89,24 @@ export type EditSignalForwarder = {
  * Build the forwarder. One instance per channel composition; `send` is the
  * channel's sender, so this module stays free of socket and capability
  * details (the channel decides whether a notification can be delivered).
+ * `canSend` is the channel's cheap "could this land right now?" gate (the
+ * connected server declared `capabilities.editTransaction`): it is consulted
+ * BEFORE a notification is built, so a session with no capable extension pays
+ * only the tool-call bookkeeping instead of a full validation + serialization.
  */
-export function createEditSignalForwarder(send: EditSignalSink): EditSignalForwarder {
+export function createEditSignalForwarder(
+  send: EditSignalSink,
+  canSend: () => boolean = () => true,
+): EditSignalForwarder {
   let session: EditSignalSession | undefined
   let disposed = false
   /** callId → tool name, insertion-ordered so the oldest call is evicted first. */
   const openCalls = new Map<string, string>()
-  /** Forwarded call ids, insertion-ordered like `openCalls`. */
+  /** Forwarded call ids, insertion-ordered like `openCalls`. The pairing above
+   *  already swallows a duplicated `tool/result` (the first result deletes the
+   *  entry), so this set only matters when the same id is re-issued as a fresh
+   *  `tool/call`: its later result must not become a second review entry.
+   *  Bounded by {@link MAX_SENT_CALL_IDS} so a long session stays flat. */
   const sentCalls = new Set<string>()
 
   const remember = (callId: string): void => {
@@ -169,6 +179,9 @@ export function createEditSignalForwarder(send: EditSignalSink): EditSignalForwa
     const messagePayload = message as unknown as Parameters<typeof toolResultPayload>[0]
     const failed = (data.error !== undefined && data.error !== null) || toolResultPayload(messagePayload).isError
     if (failed && meta?.stopped !== true) return
+    // Nothing to deliver (no capable extension, or the link is down): skip the
+    // whole validation/serialization step. `send` still reports the same false.
+    if (!canSend()) return
     const notification = buildNotification(session, callId, tool, meta)
     if (notification === undefined) return
     if (!send(notification)) return
@@ -270,7 +283,7 @@ function buildNotification(
       files: [{ path, operation: 'create', diffs: [] }],
       ...(meta.stopped === true ? { stopped: true } : {}),
     }
-    return fitsNotification(created) ? created : undefined
+    return created
   }
   const files = new Map<string, FileHunks>()
   let hunks = 0
@@ -283,7 +296,7 @@ function buildNotification(
       const hunk = parseHunk(rawDiff)
       if (hunk === undefined) return undefined
       chars += hunk.path.length + hunk.oldText.length + hunk.newText.length
-      if (chars > MAX_NOTIFICATION_CHARS) return undefined
+      if (chars > MAX_EDIT_TRANSACTION_CHARS) return undefined
       const path = absolutePath(hunk.path, session.cwd)
       if (path === undefined) return undefined
       const entry = files.get(path) ?? { path, diffs: [] }
@@ -309,16 +322,5 @@ function buildNotification(
     })),
     ...(meta.stopped === true ? { stopped: true } : {}),
   }
-  return fitsNotification(notification) ? notification : undefined
-}
-
-/** Final guard on the serialized envelope: the per-text accounting above
- *  already bounds a normal payload, so this only catches envelope overhead
- *  and non-string field growth before the frame leaves the process. */
-function fitsNotification(notification: EditTransactionNotification): boolean {
-  try {
-    return JSON.stringify(notification).length <= MAX_NOTIFICATION_CHARS
-  } catch {
-    return false
-  }
+  return notification
 }
